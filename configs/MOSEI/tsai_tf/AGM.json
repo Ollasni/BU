@@ -1,0 +1,66 @@
+{
+  "training_params": {
+    "batch_size": 32,
+    "test_batch_size": 32,
+    "tdqm_disable": true
+  },
+  "optimizer": {
+    "type": "Adaw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
+  },
+  "scheduler": {"type":"cosanneal", "max_lr": 0.003, "warm_up_steps": 2000},
+  "dataset": {"modalities": {"video": {"activate": true}, "audio": {"activate": true},"text": {"activate": true}}},
+  "model": {
+    "model_class": "ConcatClassifier_MOSEI_AGM_pre",
+    "args": {
+      "activate": {
+        "video": true,
+        "audio": true,
+        "text": true
+      },
+      "fusion": "late",
+      "cls_type": "linear",
+      "fc_inner": 512,
+      "d_model": 40,
+      "num_classes": 1,
+      "clip_grad": false,
+      "clip_value": 1.0,
+      "bias_infusion": {
+        "method": "AGM_3mod_reg",
+        "alpha": 0.8,
+        "starting_epoch": 0,
+        "ending_epoch": 1500,
+        "use": true,
+        "plot": false
+      },
+      "dataset": "MOSEI",
+      "multi_loss": {
+        "multi_supervised_w": {
+          "combined": 1, "c": 1, "g": 1, "f": 1
+        }
+      }
+    },
+    "encoders": [
+          {
+            "model": "MULTModel_Uni",
+            "args": { "activate": {"video": false, "audio": true, "text": false}, "num_classes": 1, "freeze_encoder": false},
+            "pretrainedEncoder": {"use": false, "dir": "unimodal_audio_Tsai.pth.tar"}
+          },
+          {
+            "model": "MULTModel_Uni",
+            "args": { "activate": {"video": true, "audio": false, "text": false}, "num_classes": 1, "freeze_encoder": false},
+            "pretrainedEncoder": {"use": false, "dir": "unimodal_video_Tsai.pth.tar"}
+          },
+          {
+            "model": "MULTModel_Uni",
+            "args": { "activate": {"video": false, "audio": false, "text": true}, "num_classes": 1, "freeze_encoder": false},
+            "pretrainedEncoder": {"use": false, "dir": "unimodal_text_Tsai.pth.tar"}
+          }
+      ],
+    "load_ongoing": false,
+    "save_dir": "AGM_Tsai_{}.pth.tar"
+  }
+}

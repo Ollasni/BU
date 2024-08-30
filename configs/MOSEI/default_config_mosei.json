@@ -1,0 +1,61 @@
+{
+  "exp_name": "MOSEI Experiment",
+  "agent": "Agent",
+  "task": "regression",
+  "training_params": {
+    "cuda": true,
+    "gpu_device": [0],
+    "seed": 109,
+    "batch_size": 32,
+    "test_batch_size": 32,
+    "data_loader_workers": 0,
+    "pin_memory": true,
+    "async_loading": true,
+    "validation": true,
+    "rec_test": true,
+    "test_on_bottoms": false,
+    "use_test_set": true,
+    "verbose": true,
+    "adversarial_training": {
+      "use": false,
+      "adv_epsilon": 0.01
+    },
+    "tdqm_disable": true,
+    "wandb_disable": true,
+    "res": true
+  },
+  "optimizer": {
+    "type": "Adaw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
+  },
+  "early_stopping": {
+    "max_epoch": 1500,
+    "end_of_epoch_check": true,
+    "log_interval": 10,
+    "save_every_valstep": 1,
+    "save_every_step": 3000,
+    "validate_every": 500,
+    "validate_after": 0,
+    "n_steps_stop": 30,
+    "n_steps_stop_after": 0
+  },
+  "dataset": {
+      "dataloader_class": "CMU_MOSEI_Dataloader",
+      "data_split": {},
+      "max_seq_len": 50,
+      "max_pad": true,
+      "flatten_time_series": false,
+      "task": "regression",
+      "data_type": "mosei",
+      "z_norm": false,
+      "aligned": false,
+      "data_path": "/esat/smcdata/users/kkontras/Image_Dataset/no_backup/CMU_MOSEI/mosei_senti_data.pkl",
+      "shuffle_train": true
+  },
+  "model":{
+      "save_base_dir": "/esat/smcdata/users/kkontras/Image_Dataset/no_backup/data/2023_data/MOSEI_models"
+}
+}

@@ -1,0 +1,30 @@
+{
+  "training_params": {
+    "batch_size": 32,
+    "test_batch_size": 32
+    },
+  "optimizer": {
+    "type": "Adaw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
+  },
+  "scheduler": {"type":"cosanneal", "max_lr": 0.003, "warm_up_steps": 2000},
+  "dataset": {"modalities": {"video": {"activate": true}, "audio": {"activate": false},"text": {"activate": true}}},
+  "model": {
+    "model_class": "MULTModel_Uni",
+    "args": {
+      "activate": {"video": true, "audio": false, "text": false},
+      "num_classes": 1,
+      "dataset": "MOSEI",
+      "multi_loss": {
+        "multi_supervised_w": {
+             "combined": 1
+          }
+      }
+    },
+    "load_ongoing": false,
+    "save_dir": "unimodal_video_Tsai_{}.pth.tar"
+  }
+}
