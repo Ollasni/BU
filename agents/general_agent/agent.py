@@ -1,18 +1,9 @@
 
 from datasets import *
-from datasets.Mnist import *
-from datasets.Color_Mnist.Color_Mnist_Dataset import *
 from datasets.AVE.AVE_Dataset import *
 from datasets.MOSEI.MOSEI_Dataset import *
-from datasets.AVMnist.AVMnist_Dataset import *
 from datasets.CREMAD.CREMAD_Dataset import *
-from datasets.Kinetics.MyKinetics_Dataset import *
-from datasets.Kinetics.Kinetics_Dataset import *
-from datasets.GaussianMutual.gaussianmutual import *
 from datasets.UCF101.UCF101_Dataset import *
-from datasets.SthSth.dataset_factory import SthSth_VideoLayoutFlow
-from datasets.SthSth.Pre_Features_Dataloader import SthSth_PreFeatureDataloader
-
 from utils.deterministic_pytorch import deterministic
 from utils.misc import print_cuda_statistics
 from agents.general_agent.helpers.Loader import Loader

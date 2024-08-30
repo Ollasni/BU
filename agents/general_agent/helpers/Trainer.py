@@ -17,7 +17,7 @@ os.environ['TRANSFORMERS_CACHE'] = "/esat/smcdata/users/kkontras/Image_Dataset/n
 
 sns.set_palette("bright")
 
-from utils.losses.CCA import CCA_Loss, pearson_correlation_coefficient
+# from utils.losses.CCA import CCA_Loss, pearson_correlation_coefficient
 
 class Trainer():
 

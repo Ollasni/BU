@@ -9,7 +9,7 @@ from .backbone import resnet18
 # from .fusion_modules import SumFusion, ConcatFusion, FiLM, GatedFusion
 import einops
 import copy
-from models.VAVL_git.VAVL.conformer.model import Conformer
+# from models.VAVL_git.VAVL.conformer.model import Conformer
 from models.fusion_gates import *
 from torch.distributions import Categorical, Normal
 from typing import Dict

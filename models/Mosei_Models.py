@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from transformers import AutoProcessor, ASTModel, ASTConfig, HubertForSequenceClassification, HubertModel, HubertConfig, AutoModelForCTC, Wav2Vec2FeatureExtractor, AutoFeatureExtractor, Wav2Vec2Config, Wav2Vec2Model
 from transformers import Wav2Vec2ConformerConfig, Wav2Vec2ConformerModel
-from models.VAVL_git.VAVL.conformer.model import Conformer
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
 class Mosei_A_CLS(nn.Module):

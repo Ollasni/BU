@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from transformers import AutoProcessor, ASTModel, ASTConfig, HubertForSequenceClassification, HubertModel, HubertConfig, AutoModelForCTC, Wav2Vec2FeatureExtractor, AutoFeatureExtractor, Wav2Vec2Config, Wav2Vec2Model
 from transformers import Wav2Vec2ConformerConfig, Wav2Vec2ConformerModel
-from models.VAVL_git.VAVL.conformer.model import Conformer
+# from models.VAVL_git.VAVL.conformer.model import Conformer
 from transformers import VivitModel, VivitConfig, VivitImageProcessor
 
 
