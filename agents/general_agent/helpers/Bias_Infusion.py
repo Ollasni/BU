@@ -297,7 +297,7 @@ class Bias_Infusion_OGM(General_Bias_Infusion):
         plt.show()
 class Bias_Infusion_MLB(General_Bias_Infusion):
     def __init__(self, agent):
-        super(Bias_Infusion_OGM_Mine, self).__init__(agent)
+        super().__init__(agent)
         logging.info("Bias Infusion OGM-Mine is being employed")
         self._initialize_logs_n_utils()
 
@@ -408,7 +408,7 @@ class Bias_Infusion_MLB(General_Bias_Infusion):
                     parms.grad *= coeff_1
 class Bias_Infusion_MLB_3d(General_Bias_Infusion):
     def __init__(self, agent):
-        super(Bias_Infusion_OGM_Mine_3d, self).__init__(agent)
+        super().__init__(agent)
         logging.info("Bias Infusion OGM-Mine is being employed")
         self._initialize_logs_n_utils()
 
@@ -514,7 +514,7 @@ class Bias_Infusion_MLB_3d(General_Bias_Infusion):
                     parms.grad *= coeff_2
 class Bias_Infusion_MLB_3d_Reg(General_Bias_Infusion):
     def __init__(self, agent):
-        super(Bias_Infusion_OGM_Mine_3d_Reg, self).__init__(agent)
+        super().__init__(agent)
         logging.info("Bias Infusion OGM-Mine is being employed")
         self._initialize_logs_n_utils()
 

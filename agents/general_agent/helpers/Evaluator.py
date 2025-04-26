@@ -43,13 +43,7 @@ class General_Evaluator:
 
         self.best_acc = 0.0
         self.best_loss = 0.0
-        if hasattr(self.config.model, "encoders"):
-            if "VaVL" in self.config.model.encoders[0].model:
-                with open('./conf_vit_uni_val.pkl', 'rb') as f:
-                    self.multi_fold_results = pickle.load(f)
-            else:
-                with open('./conf_res_uni_val.pkl', 'rb') as f:
-                    self.multi_fold_results = pickle.load(f)
+        self.multi_fold_results = None
 
 
 
@@ -208,6 +202,7 @@ class General_Evaluator:
                 synergy = cm[0, 1] / (cm[0].sum())
                 coexistence = cm[3, 1] / (cm[3].sum())
                 return {"cue_audio": cue_audio, "cue_video": cue_video, "synergy":synergy, "coexistence":coexistence}
+        return None
 
     def is_best(self, metrics = None, best_logs=None):
         if metrics is None:

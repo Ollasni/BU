@@ -7,346 +7,367 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-import pdb
 import random
 import json
 from sklearn.model_selection import train_test_split
 import multiprocessing
-# from transformers import VivitImageProcessor
-import einops
 import torchaudio
 from tqdm import tqdm
-from collections import defaultdict
 import logging
 import librosa
+import sys
+
+def collate_fn_padd(batch):
+    aggregated_batch = {}
+    for key in batch[0].keys():
+        if key == "data":
+            aggregated_batch[key] = {}
+            for subkey in batch[0][key].keys():
+                # Собираем все тензоры данной "подмодальности" (subkey)
+                aggregated_list = [d[key][subkey] for d in batch if d[key][subkey] is not False]
+
+                if aggregated_list:
+                    # ----- Случай 1: Спектрограмма -----
+                    # subkey == 0 (в вашем коде означает spectrogram)
+                    if subkey == 0:
+                        # Ищем максимальные размеры freq и time
+                        max_freq = max(sp.shape[0] for sp in aggregated_list)
+                        max_time = max(sp.shape[1] for sp in aggregated_list)
+
+                        padded_spectros = []
+                        for sp in aggregated_list:
+                            freq, time = sp.shape
+                            # Создаём тензор нулей [max_freq, max_time], куда копируем данные
+                            pad_sp = torch.zeros((max_freq, max_time), dtype=sp.dtype)
+                            pad_sp[:freq, :time] = sp
+                            padded_spectros.append(pad_sp.unsqueeze(0))  
+                            # теперь shape одного элемента → (1, max_freq, max_time)
+
+                        # После паддинга склеиваем по batch размерности
+                        aggregated_batch[key][subkey] = torch.cat(padded_spectros, dim=0)
+                    
+                    # ----- Случай 2: Видео -----
+                    elif subkey == 1:
+                        # Для видео обычно все кадры одного размера, поэтому .cat() напрямую
+                        aggregated_batch[key][subkey] = torch.cat(
+                            [d.unsqueeze(0) for d in aggregated_list], dim=0
+                        )
+
+                    # ----- Случай 3: Остальные (Audio=2, Face=3, Face_image=4) -----
+                    else:
+                        lengths = [len(d) for d in aggregated_list]
+                        # Для Face/Face_image обрезаем до 150; для Audio - полную длину
+                        max_length = min(max(lengths), 150) if subkey in [3, 4] else max(lengths)
+                        aggregated_list = [d[:max_length] for d in aggregated_list]
+                        padded = torch.nn.utils.rnn.pad_sequence(aggregated_list, batch_first=True)
+                        aggregated_batch[key][subkey] = padded
+
+                        # Добавляем attention mask
+                        if subkey in [2, 3, 4]:  # Audio=2, Face=3, Face_image=4
+                            mask = torch.zeros((len(aggregated_list), max_length))
+                            for i, dur in enumerate(lengths):
+                                mask[i, :min(dur, max_length)] = 1
+                            aggregated_batch[key][f"attention_mask_{subkey}"] = mask
+
+                else:
+                    # Ни у одного элемента batch нет этой модальности → False
+                    aggregated_batch[key][subkey] = False
+
+        else:
+            # Ключ "label" или "idx"
+            aggregated_batch[key] = torch.LongTensor([d[key] for d in batch])
+    return aggregated_batch
 
 class CremadDataset(Dataset):
 
-    def __init__(self, config, visual_path="/esat/smcdata/users/kkontras/Image_Dataset/no_backup/CremaD/CREMA-D",
-                 audio_path="/esat/smcdata/users/kkontras/Image_Dataset/no_backup/CremaD/CREMA-D/AudioWAV", fps=1, mode='train'):
-        self.image = []
-        self.face_image = []
-        self.audio = []
-        self.faces = []
+    def __init__(self, config, visual_path="/content/drive/MyDrive/CREMA/Datasets",
+                 audio_path="/content/drive/MyDrive/CREMA/Datasets/AudioWAV", fps=1, mode='train'):
+        # Смотрим, какие модальности включены в конфиге
+        self.active_modalities = config.dataset.get(
+            "return_data",
+            {"video": True, "spectrogram": True, "audio": False, "face": False, "face_image": False}
+        )
+        
+        # Инициализируем self.data с учётом того, что spectrogram может тоже требовать audio.
+        self.data = {}
+        if self.active_modalities.get("video", False):
+            self.data["video"] = []
+        if self.active_modalities.get("face", False):
+            self.data["face"] = []
+        if self.active_modalities.get("face_image", False):
+            self.data["face_image"] = []
+        # Если хотя бы одна из audio или spectrogram активна – нужен ключ "audio"
+        if self.active_modalities.get("audio", False) or self.active_modalities.get("spectrogram", False):
+            self.data["audio"] = []
+
         self.label = []
         self.mode = mode
         self.fps = fps
         self.config = config
-        self.num_frame = self.config.dataset.get("num_frame",3)
-        data_split = self.config.dataset.get("data_split", {"a":0})
-        fold = data_split.get("fold",0)
+        self.num_frame = self.config.dataset.get("num_frame", 3)
+        data_split = self.config.dataset.get("data_split", {"a": 0})
+        fold = data_split.get("fold", 0)
         self.norm_type = self.config.dataset.get("norm_type", False)
-        self.config = self.config
         self.sampling_rate = self.config.dataset.sampling_rate
 
-        # self.image_processor = VivitImageProcessor.from_pretrained("google/vivit-b-16x2-kinetics400")
+        # Выводим активные модальности
+        print("Используемые модальности:")
+        for modality, enabled in self.active_modalities.items():
+            if enabled:
+                print(f"- {modality}")
 
-        self.return_data = config.dataset.get("return_data", {"video": True, "spectrogram":True, "audio":False, "face":False, "face_image":False})
+        class_dict = {'NEU': 0, 'HAP': 1, 'SAD': 2, 'FEA': 3, 'DIS': 4, 'ANG': 5}
 
-
-        class_dict = {'NEU':0, 'HAP':1, 'SAD':2, 'FEA':3, 'DIS':4, 'ANG':5}
-
+        # Пути к данным
         self.visual_feature_path = self.config.dataset.data_roots
         self.audio_feature_path = os.path.join(self.config.dataset.data_roots, "AudioWAV")
         self.face_feature_path = os.path.join(self.config.dataset.data_roots, "Face_features")
         self.face_image_path = os.path.join(self.config.dataset.data_roots, "Face_features_images")
 
+        # Проверка базовых директорий
+        required_paths = {}
+        if self.active_modalities.get("video", False):
+            required_paths["visual"] = self.visual_feature_path
+        # Даже если audio=False, но spectrogram=True – нам всё равно нужна директория с аудио
+        if self.active_modalities.get("audio", False) or self.active_modalities.get("spectrogram", False):
+            required_paths["audio"] = self.audio_feature_path
+        if self.active_modalities.get("face", False):
+            required_paths["face_features"] = self.face_feature_path
+        if self.active_modalities.get("face_image", False):
+            required_paths["face_images"] = self.face_image_path
 
+        missing_paths = [name for name, path in required_paths.items() if not os.path.exists(path)]
+        if missing_paths:
+            print(f"Ошибка: следующие директории не найдены: {missing_paths}")
+            sys.exit(1)
+
+        # Выбор метода разделения
         if data_split.get("method", "inclusive") == "inclusive":
             self.split_inclusive(mode, class_dict)
         elif data_split.get("method", "inclusive") == "non_inclusive":
             self.split_noninclusive(fold, mode, class_dict)
-        else: raise ValueError("config.dataset.data_split should be either 'inclusive' or 'non_inclusive', then {} is not an option".format(self.config.dataset.get("data_split", "inclusive")))
-
-
-        if self.config.dataset.get("norm_wav_path", None) and os.path.exists(self.config.dataset.get("norm_wav_path", None)):
-            self.wav_norm = pickle.loads(open(self.config.dataset.norm_wav_path, "rb").read())
-            logging.info("Loaded wav norm from {}".format(self.config.dataset.norm_wav_path))
-            logging.info("Norm values are {}".format(self.wav_norm))
         else:
-            if mode == 'train':
-                self.get_wav_normalizer()
-                save_dir = self.config.dataset.get("norm_wav_path", None) if self.config.dataset.get("norm_wav_path", None) is not None else "./datasets/CREMAD/wav_norm.pkl"
-                logging.warning("Saving wav norm to {}".format(save_dir))
+            raise ValueError(
+                "config.dataset.data_split должно быть 'inclusive' или 'non_inclusive', "
+                f"получили: {self.config.dataset.get('data_split', 'inclusive')}"
+            )
 
+        # Проверка, что данные загружены
+        if not any(len(v) > 0 for v in self.data.values()):
+            print(f"Ошибка: не найдены данные для активных модальностей в режиме {mode}")
+            sys.exit(1)
 
-        if self.config.dataset.get("norm", True):
+        # Нормализация аудио (если audio или spectrogram включены)
+        if (self.active_modalities.get("audio", False) or self.active_modalities.get("spectrogram", False)):
+            if self.config.dataset.get("norm_wav_path", None) and os.path.exists(self.config.dataset.get("norm_wav_path", None)):
+                self.wav_norm = pickle.loads(open(self.config.dataset.norm_wav_path, "rb").read())
+                logging.info(f"Loaded wav norm from {self.config.dataset.norm_wav_path}")
+                logging.info(f"Norm values are {self.wav_norm}")
+            else:
+                if mode == 'train':
+                    self.get_wav_normalizer()
+                    save_dir = self.config.dataset.get("norm_wav_path", None) or "./datasets/CREMAD/wav_norm.pkl"
+                    logging.warning(f"Saving wav norm to {save_dir}")
+
+        # Нормализация лиц
+        if self.active_modalities.get("face", False) and self.config.dataset.get("norm", True):
             if self.config.dataset.get("norm_face_path", None) and os.path.exists(self.config.dataset.get("norm_face_path", None)):
                 self.face_norm = pickle.loads(open(self.config.dataset.norm_face_path, "rb").read())
-                logging.info("Loaded face norm from {}".format(self.config.dataset.norm_face_path))
-                logging.info("Norm values are {}".format(self.face_norm))
+                logging.info(f"Loaded face norm from {self.config.dataset.norm_face_path}")
+                logging.info(f"Norm values are {self.face_norm}")
             else:
                 if mode == 'train':
                     self.get_face_normalizer()
-                    save_dir = self.config.dataset.get("norm_face_path", None) if self.config.dataset.get("norm_face_path", None) is not None else "./datasets/CREMAD/face_norm.pkl"
-                    logging.warning("Saving face norm to {}".format(save_dir))
-
-    def make_barplots(self, class_dict):
-        num_images = []
-        for idx in range(len(self.image)):
-            num_images.append(len(os.listdir(str(self.image[idx]))))
-        num_images = np.array(num_images)
-
-        import matplotlib.pyplot as plt
-        num, count = np.unique(num_images, return_counts=True)
-        plt.bar(num, count)
-        plt.title(self.mode)
-        plt.show()
-
-        num, count = np.unique( self.label, return_counts=True)
-        plt.bar(class_dict.keys(), count)
-        plt.xticks(range(len(num)), class_dict.keys(), rotation='vertical')
-        plt.title(self.mode)
-        plt.tight_layout()
-        plt.show()
+                    save_dir = self.config.dataset.get("norm_face_path", None) or "./datasets/CREMAD/face_norm.pkl"
+                    logging.warning(f"Saving face norm to {save_dir}")
 
     def split_inclusive(self, mode, class_dict):
-
-        # with open('./datasets/CREMAD/normalization_audio_OGM.pkl', "r") as json_file:
-        #     self.norm_audio = json.load(json_file)
-        #     self.norm_audio = json.loads(self.norm_audio)
-
+        """
+        Если выбран метод 'inclusive', мы читаем train.csv и test.csv,
+        а затем делаем дополнительный train/val/test split (stratified_split).
+        """
         self.norm_audio = {"total": {"mean": -7.1276217, "std": 5.116028}}
+        self.train_data = {}
+        self.test_data = {}
+        # Инициализируем train_data/test_data теми же ключами, что и self.data, 
+        # чтобы было куда складывать пути
+        for k in self.data.keys():
+            self.train_data[k] = []
+            self.test_data[k] = []
 
-        self.train_image, self.train_face_image, self.train_audio, self.train_faces, self.train_label, self.train_item = [], [], [], [], [], []
-        self.test_image, self.test_face_image, self.test_audio, self.test_faces, self.test_label, self.test_item = [], [], [], [], [], []
+        self.train_label, self.test_label, self.train_item, self.test_item = [], [], [], []
+
         self.train_csv = './datasets/CREMAD/train.csv'
         self.test_csv = './datasets/CREMAD/test.csv'
-        with open(self.train_csv, encoding='UTF-8-sig') as f2:
-            csv_reader = csv.reader(f2)
-            for item in csv_reader:
-                audio_path = os.path.join(self.audio_feature_path, item[0] + '.wav')
-                visual_path = os.path.join(self.visual_feature_path, 'Image-01-FPS', item[0])
-                face_path = os.path.join(self.face_feature_path,  item[0] + '.npy')
-                face_image_path = os.path.join(self.face_image_path,  item[0] + '.npy')
-                if os.path.exists(audio_path) and os.path.exists(visual_path) and os.path.exists(face_path):
-                    self.train_item.append(item[0])
-                    self.train_image.append(visual_path)
-                    self.train_face_image.append(face_image_path)
-                    self.train_audio.append(audio_path)
-                    self.train_faces.append(audio_path)
-                    self.train_label.append(class_dict[item[1]])
-                else:
-                    continue
-        with open(self.test_csv, encoding='UTF-8-sig') as f2:
-            csv_reader = csv.reader(f2)
-            for item in csv_reader:
-                audio_path = os.path.join(self.audio_feature_path, item[0] + '.wav')
-                visual_path = os.path.join(self.visual_feature_path, 'Image-01-FPS', item[0])
-                face_path = os.path.join(self.face_feature_path,  item[0] + '.npy')
-                face_image_path = os.path.join(self.face_image_path,  item[0] + '.npy')
-                if os.path.exists(audio_path) and os.path.exists(visual_path) and os.path.exists(face_path):
-                    self.test_item.append(item[0])
-                    self.test_image.append(visual_path)
-                    self.test_audio.append(audio_path)
-                    self.test_faces.append(face_path)
-                    self.test_face_image.append(face_image_path)
-                    self.test_label.append(class_dict[item[1]])
-                else:
-                    continue
 
+        if not os.path.exists(self.train_csv) or not os.path.exists(self.test_csv):
+            print(f"Ошибка: CSV-файлы не найдены: train_csv={self.train_csv}, test_csv={self.test_csv}")
+            sys.exit(1)
 
-        # if mode == "train":
-        #     self.item = self.train_item[:int(len(self.train_item) * 0.9)]
-        #     self.image = self.train_image[:int(len(self.train_image) * 0.9)]
-        #     self.audio = self.train_audio[:int(len(self.train_audio) * 0.9)]
-        #     self.label = self.train_label[:int(len(self.train_label) * 0.9)]
+        def load_data(csv_file, data_dict, label_list, item_list):
+            with open(csv_file, encoding='UTF-8-sig') as f:
+                csv_reader = csv.reader(f)
+                for row in csv_reader:
+                    file_id, emotion_label = row[0], row[1]
+                    paths = {
+                        "video": os.path.join(self.visual_feature_path, 'Image-01-FPS', file_id),
+                        "audio": os.path.join(self.audio_feature_path, file_id + '.wav'),
+                        "face": os.path.join(self.face_feature_path, file_id + '.npy'),
+                        "face_image": os.path.join(self.face_image_path, file_id + '.npy')
+                    }
+                    
+                    # Нужно учесть, что аудио нам нужно, если audio=True или spectrogram=True
+                    need_audio = self.active_modalities.get("audio", False) or self.active_modalities.get("spectrogram", False)
+                    
+                    # Собираем список модальностей, которые нужно проверить на существование
+                    check_mods = []
+                    if self.active_modalities.get("video", False):
+                        check_mods.append("video")
+                    if need_audio:
+                        check_mods.append("audio")
+                    if self.active_modalities.get("face", False):
+                        check_mods.append("face")
+                    if self.active_modalities.get("face_image", False):
+                        check_mods.append("face_image")
+
+                    all_exist = all(os.path.exists(paths[m]) for m in check_mods)
+                    if all_exist:
+                        item_list.append(file_id)
+
+                        # Если video включено, сохраняем путь
+                        if self.active_modalities.get("video", False):
+                            data_dict["video"].append(paths["video"])
+                        # Если audio ИЛИ spectrogram включены, сохраняем путь в audio
+                        if need_audio:
+                            data_dict["audio"].append(paths["audio"])
+                        if self.active_modalities.get("face", False):
+                            data_dict["face"].append(paths["face"])
+                        if self.active_modalities.get("face_image", False):
+                            data_dict["face_image"].append(paths["face_image"])
+
+                        label_list.append(class_dict[emotion_label])
+                    else:
+                        print(f"Пропущен {file_id}: отсутствуют файлы для активных модальностей")
+
+        # Загружаем train.csv → в self.train_data
+        load_data(self.train_csv, self.train_data, self.train_label, self.train_item)
+        # Загружаем test.csv → в self.test_data
+        load_data(self.test_csv, self.test_data, self.test_label, self.test_item)
 
         self.split_mode = "stratified_split"
-        # self.split_mode = "val_stratified_split"
-        # self.split_mode = "90_percent"
-        # self.split_mode = "90_percent_val"
-
         print(self.split_mode)
 
+        # Теперь объединим train и test (по сути, это "train+test" до split'a)
         if self.split_mode == "stratified_split":
+            total_data = {}
+            for k in self.data.keys():
+                total_data[k] = self.train_data[k] + self.test_data[k]
+            total_item = self.train_item + self.test_item
+            total_label = self.train_label + self.test_label
 
-            self.total_item = self.train_item + self.test_item
-            self.total_image = self.train_image + self.test_image
-            self.total_audio = self.train_audio + self.test_audio
-            self.total_faces = self.train_faces + self.test_faces
-            self.total_face_image = self.train_face_image + self.test_face_image
-            self.total_label = self.train_label + self.test_label
+            X = []
+            # Идём в порядке ["video", "audio", "face", "face_image"] — но только для тех, кто есть в self.data
+            # (иначе будет несоответствие длины)
+            mods_in_use = [m for m in ["video","audio","face","face_image"] if m in self.data]
+            for m in mods_in_use:
+                X.append(total_data[m])
+            X.append(total_item)  # последний столбец – имя файла
+            X = np.array(X).T  # shape: (samples, num_modalities+1)
+            y = np.array(total_label)
+
+            # Делим на train+val и test
             X_trainval, X_test, y_trainval, y_test = train_test_split(
-                np.array([self.total_item, self.total_image, self.total_audio, self.total_faces, self.total_face_image]).T,
-                np.array(self.total_label),
+                X, y,
                 test_size=self.config.dataset.get("val_split_rate", 0.1),
                 random_state=self.config.training_params.seed,
-                stratify=np.array(self.total_label))
-
+                stratify=y
+            )
+            # Делим X_trainval на train и val
             X_train, X_val, y_train, y_val = train_test_split(
-                X_trainval,
-                y_trainval,
+                X_trainval, y_trainval,
                 test_size=self.config.dataset.get("val_split_rate", 0.1),
                 random_state=self.config.training_params.seed,
-                stratify=y_trainval)
+                stratify=y_trainval
+            )
 
             if mode == "test":
-                X = X_test
-                y = y_test
+                X_final, y_final = X_test, y_test
             elif mode == "train":
-                X = X_train
-                y = y_train
+                X_final, y_final = X_train, y_train
             elif mode == "val":
-                X = X_val
-                y = y_val
+                X_final, y_final = X_val, y_val
+            else:
+                raise ValueError(f"Неизвестный режим: {mode}")
 
-            self.item = X[:, 0]
-            self.image = X[:, 1]
-            self.audio = X[:, 2]
-            self.faces = X[:, 3]
-            self.face_images = X[:, 4]
-            self.label = y
-
-        elif self.split_mode == "val_stratified_split":
-
-            if mode == "test":
-
-                self.item = self.test_item[:int(len(self.test_item))]
-                self.image = self.test_image[:int(len(self.test_image))]
-                self.audio = self.test_audio[:int(len(self.test_audio))]
-                self.faces = self.test_faces[:int(len(self.test_faces))]
-                self.face_image = self.test_face_image[:int(len(self.test_face_image))]
-                self.label = self.test_label[:int(len(self.test_label))]
-
-            elif mode == "val" or mode == "train":
-
-                X_train, X_val, y_train, y_val = train_test_split(np.array([self.train_item, self.train_image, self.train_audio, self.train_faces, self.train_face_image]).T,
-                                                                    np.array(self.train_label),
-                                                                    test_size=self.config.dataset.get("val_split_rate", 0.1),
-                                                                    random_state=self.config.training_params.seed,
-                                                                    stratify=np.array(self.train_label))
-
-                if mode == "train":
-                    X = X_train
-                    y = y_train
-                elif mode == "val":
-                    X = X_val
-                    y = y_val
-
-                self.item = X[:, 0]
-                self.image = X[:, 1]
-                self.audio = X[:, 2]
-                self.faces = X[:, 3]
-                self.face_image = X[:, 4]
-                self.label = y
-
-        elif self.split_mode == "90_percent":
-            if mode == "train":
-                self.item = self.train_item[:int(len(self.train_item) * 0.9)]
-                self.image = self.train_image[:int(len(self.train_image) * 0.9)]
-                self.audio = self.train_audio[:int(len(self.train_audio) * 0.9)]
-                self.faces = self.train_faces[:int(len(self.train_faces) * 0.9)]
-                self.face_image = self.train_face_image[:int(len(self.train_face_image) * 0.9)]
-                self.label = self.train_label[:int(len(self.train_label) * 0.9)]
-            elif mode == "test":
-                self.item = self.test_item[:int(len(self.test_item) * 0.9)]
-                self.image = self.test_image[:int(len(self.test_image) * 0.9)]
-                self.audio = self.test_audio[:int(len(self.test_audio) * 0.9)]
-                self.faces = self.test_faces[:int(len(self.test_faces) * 0.9)]
-                self.face_image = self.test_face_image[:int(len(self.test_face_image) * 0.9)]
-                self.label = self.test_label[:int(len(self.test_label) * 0.9)]
-            elif mode == "val":
-                self.item = self.train_item[int(len(self.train_item) * 0.9):]
-                for k in self.test_item[int(len(self.test_item) * 0.9):]:
-                    self.item.append(k)
-                self.image = self.train_image[int(len(self.train_image) * 0.9):]
-                for k in self.test_image[int(len(self.test_image) * 0.9):]:
-                    self.image.append(k)
-
-                self.audio = self.train_audio[int(len(self.train_audio) * 0.9):]
-                for k in self.test_audio[int(len(self.test_audio) * 0.9):]:
-                    self.audio.append(k)
-
-                self.faces = self.train_faces[int(len(self.train_faces) * 0.9):]
-                for k in self.test_faces[int(len(self.test_faces) * 0.9):]:
-                    self.faces.append(k)
-
-                self.face_image = self.train_face_image[int(len(self.train_face_image) * 0.9):]
-                for k in self.test_face_image[int(len(self.test_face_image) * 0.9):]:
-                    self.face_image.append(k)
-
-                self.label = self.train_label[int(len(self.train_label) * 0.9):]
-                for k in self.test_label[int(len(self.test_label) * 0.9):]:
-                    self.label.append(k)
-
-        elif self.split_mode == "90_percent_val":
-            if mode == "train":
-                self.item = self.train_item[:int(len(self.train_item) * 0.9)]
-                self.image = self.train_image[:int(len(self.train_image) * 0.9)]
-                self.audio = self.train_audio[:int(len(self.train_audio) * 0.9)]
-                self.faces = self.train_faces[:int(len(self.train_faces) * 0.9)]
-                self.face_image = self.train_face_image[:int(len(self.train_face_image) * 0.9)]
-                self.label = self.train_label[:int(len(self.train_label) * 0.9)]
-            elif mode == "test":
-                self.item = self.test_item
-                self.image = self.test_image
-                self.audio = self.test_audio
-                self.faces = self.test_faces
-                self.face_image = self.test_face_image
-                self.label = self.test_label
-            elif mode == "val":
-                self.item = self.train_item[int(len(self.train_item) * 0.9):]
-                self.image = self.train_image[int(len(self.train_image) * 0.9):]
-                self.audio = self.train_audio[int(len(self.train_audio) * 0.9):]
-                self.faces = self.train_faces[int(len(self.train_faces) * 0.9):]
-                self.face_image = self.train_face_image[int(len(self.train_face_image) * 0.9):]
-                self.label = self.train_label[int(len(self.train_label) * 0.9):]
+            # num_modalities – количество реальных ключей (video, audio, face, face_image)
+            num_modalities = len(mods_in_use)
+            # Заполняем self.data по колонкам
+            for i, modality in enumerate(mods_in_use):
+                self.data[modality] = X_final[:, i].tolist()
+            # последний столбец – "item"
+            self.data["item"] = X_final[:, num_modalities].tolist()
+            self.label = y_final.tolist()
 
     def split_noninclusive(self, fold, mode, class_dict):
-
+        """
+        Если выбран метод 'non_inclusive', то данные берутся из data_splits_VALV.pkl.
+        """
+        split_file = './datasets/CREMAD/data_splits_VALV.pkl'
+        if not os.path.exists(split_file):
+            print(f"Ошибка: файл разбиения {split_file} не найден")
+            sys.exit(1)
 
         with open('./datasets/CREMAD/normalization_audio.pkl', "r") as json_file:
             self.norm_audio = json.load(json_file)
 
-        # with open('./datasets/CREMAD/data_splits_persubj.pkl', "r") as json_file:
-        #     train_val_test_splits = json.load(json_file)
-        # for i in train_val_test_splits[str(fold)][mode]:
-        #     name = i.split("-")[0]
-        #     label = class_dict[i.split("_")[2]]
-        #     ap = os.path.join(self.audio_feature_path, name + ".wav")
-        #     vp = os.path.join(self.visual_feature_path, 'Image-{:02d}-FPS'.format(self.fps), name.split(".")[0])
-        #     if os.path.exists(ap) and os.path.exists(vp):
-        #         self.image.append(vp)
-        #         self.audio.append(ap)
-        #         self.label.append(label)
-        #     else:
-        #         continue
-
-        # print("We use the limited ones from VAVL paper!")
-        with open('./datasets/CREMAD/data_splits_VALV.pkl', "r") as json_file:
+        with open(split_file, "r") as json_file:
             train_val_test_splits = json.load(json_file)
 
-        self.label_from_name = []
-        for i in train_val_test_splits[str(fold+1)][mode]:
-            name = i.split("-")[0]
-            # label = int(i.split("-")[1])
-            label_from_name = class_dict[i.split("-")[0].split("_")[2]]
-            ap = os.path.join(self.audio_feature_path, name)
-            vp = os.path.join(self.visual_feature_path, 'Image-{:02d}-FPS'.format(self.fps),name.split(".")[0])
-            fp = os.path.join(self.face_feature_path, name.replace(".wav", ".npy"))
-            fi = os.path.join(self.face_image_path, name.replace(".wav", ".npy"))
+        need_audio = self.active_modalities.get("audio", False) or self.active_modalities.get("spectrogram", False)
 
-            if os.path.exists(ap) and os.path.exists(vp) and os.path.exists(fp):
-                self.image.append(vp)
-                self.audio.append(ap)
-                self.faces.append(fp)
-                self.face_image.append(fi)
-                self.label.append(label_from_name)
-                # self.label_from_name.append(label_from_name)
+        for i in train_val_test_splits[str(fold + 1)][mode]:
+            name = i.split("-")[0]
+            label = class_dict[name.split("_")[2]]  # пример: '1025_IEO_NEU_XX' → [2] = 'NEU'
+            paths = {
+                "video": os.path.join(self.visual_feature_path, f'Image-{{:02d}}-FPS'.format(self.fps), name.split(".")[0]),
+                "audio": os.path.join(self.audio_feature_path, name),
+                "face": os.path.join(self.face_feature_path, name.replace(".wav", ".npy")),
+                "face_image": os.path.join(self.face_image_path, name.replace(".wav", ".npy"))
+            }
+
+            # Собираем список, что проверять
+            check_mods = []
+            if self.active_modalities.get("video", False):
+                check_mods.append("video")
+            if need_audio:
+                check_mods.append("audio")
+            if self.active_modalities.get("face", False):
+                check_mods.append("face")
+            if self.active_modalities.get("face_image", False):
+                check_mods.append("face_image")
+
+            all_exist = all(os.path.exists(paths[m]) for m in check_mods)
+            if all_exist:
+                # Сохраняем пути
+                if self.active_modalities.get("video", False):
+                    self.data["video"].append(paths["video"])
+                if need_audio:
+                    self.data["audio"].append(paths["audio"])
+                if self.active_modalities.get("face", False):
+                    self.data["face"].append(paths["face"])
+                if self.active_modalities.get("face_image", False):
+                    self.data["face_image"].append(paths["face_image"])
+
+                self.label.append(label)
             else:
-                print("This path does not exist {} or {} or {}".format(ap, vp, fp))
-                continue
+                print(f"Пропущен {name}: отсутствуют файлы для активных модальностей")
 
     def get_wav_normalizer(self):
-
-        count = 0
-        wav_sum = 0
-        wav_sqsum = 0
-
-        max_duration = 0 #seconds
-
-        for cur_wav in tqdm(self.audio):
+        # Если совсем нет self.data["audio"], выходим
+        if not self.data.get("audio"):
+            return
+        count, wav_sum, wav_sqsum, max_duration = 0, 0, 0, 0
+        for cur_wav in tqdm(self.data["audio"]):
             audio, fps = torchaudio.load(cur_wav)
             audio = torchaudio.functional.resample(audio, fps, self.sampling_rate)
             audio = audio[0]
@@ -355,54 +376,44 @@ class CremadDataset(Dataset):
             wav_sum += torch.sum(audio)
             wav_sqsum += torch.sum(audio ** 2)
             count += len(audio)
-
         wav_mean = wav_sum / count
         wav_var = (wav_sqsum / count) - (wav_mean ** 2)
         wav_std = np.sqrt(wav_var)
-
         self.wav_norm = {"mean": wav_mean, "std": wav_std, "max_duration": max_duration}
+        save_path = self.config.dataset.get("norm_wav_path", "./datasets/CREMAD/wav_norm.pkl")
+        with open(save_path, "wb") as f:
+            f.write(pickle.dumps(self.wav_norm))
 
-        if self.config.dataset.get("norm_wav_path", None) is not None:
-            open(self.config.dataset.norm_wav_path, "wb").write(pickle.dumps(self.wav_norm))
-        else:
-            open("./datasets/CREMAD/wav_norm.pkl", "wb").write(pickle.dumps(self.wav_norm))
-
-
-        return wav_mean, wav_std
     def get_face_normalizer(self):
-
-        count = 0
-        vid_sum = 0
-        vid_sqsum = 0
-        max_faces = 0
-        for cur_vid in tqdm(self.faces):
-            feats = np.load(cur_vid) #np.transpose(np.load(vid_loc + '.npy'))
+        if not self.data.get("face", []):
+            return
+        count, vid_sum, vid_sqsum, max_faces = 0, 0, 0, 0
+        for cur_vid in tqdm(self.data["face"]):
+            feats = np.load(cur_vid)
             vid_sum += np.sum(feats, axis=0)
             vid_sqsum += np.sum(feats ** 2, axis=0)
-            count += np.shape(feats)[0]
-            if np.shape(feats)[0] > max_faces:
-                max_faces = np.shape(feats)[0]
-
+            count += feats.shape[0]
+            if feats.shape[0] > max_faces:
+                max_faces = feats.shape[0]
         vid_mean = vid_sum / count
         vid_var = (vid_sqsum / count) - (vid_mean ** 2)
         vid_std = np.sqrt(vid_var)
-
         self.face_norm = {"mean": vid_mean, "std": vid_std, "max_faces": max_faces}
-        print("max faces: ", max_faces)
-
-        if self.config.dataset.get("norm_face_path", None) is not None:
-            open(self.config.dataset.norm_face_path, "wb").write(pickle.dumps(self.face_norm))
-        else:
-            open("./datasets/CREMAD/norm_face_path.pkl", "wb").write(pickle.dumps(self.face_norm))
-
-        return vid_mean, vid_std
+        save_path = self.config.dataset.get("norm_face_path", "./datasets/CREMAD/face_norm.pkl")
+        with open(save_path, "wb") as f:
+            f.write(pickle.dumps(self.face_norm))
 
     def __len__(self):
-        return len(self.image)
+        # Возвращаем длину на основе первой "реальной" модальности (без spectrogram)
+        # Порядок можно выбирать: например, отдаем длину "audio", если есть, иначе "video" и т.д.
+        # В данном случае идём по keys() в том порядке, в котором мы их создали.
+        for m in ["video", "audio", "face", "face_image"]:
+            if m in self.data:
+                return len(self.data[m])
+        return 0
 
     def _get_images(self, idx):
-
-        if not self.return_data["video"]:
+        if "video" not in self.data:
             return False
 
         if self.mode == 'train':
@@ -410,247 +421,124 @@ class CremadDataset(Dataset):
                 transforms.ToTensor(),
                 transforms.RandomResizedCrop(224, antialias=True),
                 transforms.RandomHorizontalFlip(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                     [0.229, 0.224, 0.225])
             ])
         else:
             transform = transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Resize(size=(224, 224), antialias=True),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Resize((224, 224), antialias=True),
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                     [0.229, 0.224, 0.225])
             ])
 
-        image_samples = os.listdir(str(self.image[idx]))
-        image_samples.sort()
-
-
+        image_samples = sorted(os.listdir(self.data["video"][idx]))
         images = torch.zeros((self.num_frame, 3, 224, 224))
-        for i in range(len(image_samples)):
-            img = Image.open(os.path.join(self.image[idx], image_samples[i])).convert('RGB')
-            img = transform(img)
-            images[i] = img
-            if i == self.num_frame-1: break
+        for i, img_file in enumerate(image_samples[:self.num_frame]):
+            img = Image.open(os.path.join(self.data["video"][idx], img_file)).convert('RGB')
+            images[i] = transform(img)
 
-        images = torch.permute(images, (1,0,2,3))
-        return images
+        return torch.permute(images, (1, 0, 2, 3))
 
     def _get_face(self, idx):
-
-        if not self.return_data["face"]:
+        if "face" not in self.data:
             return False
+        face_features = torch.from_numpy(np.load(self.data["face"][idx]))
+        # Если у вас не инициализирован self.face_norm (например, mode='val'/'test' до train),
+        # нужно предусмотреть проверку. Предположим, что она есть.
+        if hasattr(self, "face_norm"):
+            return (face_features - self.face_norm["mean"]) / self.face_norm["std"]
+        else:
+            return face_features
 
-        face_features = np.load(self.faces[idx])
-        face_features = torch.from_numpy(face_features)
-
-        # if len(face_features.shape) > 2:
-        #     os.remove(self.faces[idx])
-        #     print("Deleted: ", self.faces[idx])
-
-        face_features = (face_features - self.face_norm["mean"]) / self.face_norm["std"]
-
-        return face_features
     def _get_face_image(self, idx):
-
-        if not self.return_data.get("face_image", False):
+        if "face_image" not in self.data:
             return False
-
-        face_features = np.load(self.face_image[idx])
-        face_features = torch.from_numpy(face_features)
-
-        return face_features
+        return torch.from_numpy(np.load(self.data["face_image"][idx]))
 
     def _get_audio(self, idx):
-
-        if not self.return_data["audio"]:
+        # Если audio и/или spectrogram неактивны, возвращаем False
+        if not (self.active_modalities.get("audio", False) or self.active_modalities.get("spectrogram", False)):
             return False
 
-        audio, fps = torchaudio.load(self.audio[idx])
-        audio = torchaudio.functional.resample(audio, fps, self.sampling_rate)
-        # max_duration = 10 #seconds
-        #
-        # audio = audio[0][:int(self.sampling_rate*max_duration)]
-        # audio = audio[0][:int(self.sampling_rate*3])]
-        # audio = audio[0][:int(self.sampling_rate*self.wav_norm["max_duration"])]
-        audio = audio[0]
-
+        audio, fps = torchaudio.load(self.data["audio"][idx])
+        audio = torchaudio.functional.resample(audio, fps, self.sampling_rate)[0]
         if hasattr(self, "wav_norm"):
             audio = (audio - self.wav_norm["mean"]) / self.wav_norm["std"]
-
         return audio
 
     def _get_spectrogram(self, idx, audio):
-
-        if not self.return_data["spectrogram"]:
+        if not self.active_modalities.get("spectrogram", False):
             return False
 
-
+        # Если audio=False, загружаем через librosa
         if audio is False:
-            samples, rate = librosa.load(self.audio[idx], sr=self.sampling_rate)
+            samples, _ = librosa.load(self.data["audio"][idx], sr=self.sampling_rate)
+            # Пример: вы берёте максимум 3 секунды
             resamples = np.tile(samples, 3)[:self.sampling_rate * 3]
-            resamples[resamples > 1.] = 1.
-            resamples[resamples < -1.] = -1.
+            resamples = np.clip(resamples, -1, 1)
+        else:
+            resamples = audio.numpy()
 
         spectrogram = librosa.stft(resamples, n_fft=512, hop_length=353)
         spectrogram = np.log(np.abs(spectrogram) + 1e-7)
-        spectrogram = torch.from_numpy(spectrogram)
-
-        #     audio, fps = torchaudio.load(self.audio[idx])
-        #     audio = torchaudio.functional.resample(audio, fps, self.sampling_rate)
-        #     max_duration = 3 #seconds
-        #     audio = audio[0][:self.sampling_rate*max_duration]
-        #
-        #     # audio = (audio - self.wav_norm["mean"]) / self.wav_norm["std"]
-        #
-        #     #pad if less than 3 seconds
-        #     if audio.shape[0] < self.sampling_rate*max_duration:
-        #         audio = torch.cat((audio, torch.zeros(self.sampling_rate*max_duration - audio.shape[0])))
-        #
-        #
-        # spectrogram = torchaudio.transforms.Spectrogram(n_fft=512, hop_length=353)(audio)
-        # spectrogram = torch.log(torch.abs(spectrogram) + 1e-7)
 
         if self.norm_type == "per_sample":
-            # Normalize per sample
-            mean = np.mean(spectrogram)
-            std = np.std(spectrogram)
-            spectrogram = np.divide(spectrogram - mean, std + 1e-9)
-        elif self.norm_type == "per_freq":
-            # Normalize per freq
-            mean = np.array(self.norm_audio["per_req"]["mean"])
-            std = np.array(self.norm_audio["per_req"]["std"])
-            spectrogram = np.divide(spectrogram.T - mean, std + 1e-9).T
+            spectrogram = (
+                spectrogram - np.mean(spectrogram)) / (np.std(spectrogram) + 1e-9
+            )
         elif self.norm_type == "total":
-            #Normalize per freq
-            mean = self.norm_audio["total"]["mean"]
-            std = self.norm_audio["total"]["std"]
-            spectrogram = np.divide(spectrogram - mean, std + 1e-9)
+            spectrogram = (
+                spectrogram - self.norm_audio["total"]["mean"]
+            ) / (self.norm_audio["total"]["std"] + 1e-9)
 
-        return spectrogram
+        return torch.from_numpy(spectrogram)
 
     def __getitem__(self, idx):
+        data = {}
 
-        images = self._get_images(idx)
-        audio = self._get_audio(idx)
-        face_features = self._get_face(idx)
-        face_image = self._get_face_image(idx)
-        spectrogram = self._get_spectrogram(idx, audio)
-        label = self.label[idx]
+        # 1. АУДИО: грузим, только если audio=True или spectrogram=True
+        if self.active_modalities.get("audio", False) or self.active_modalities.get("spectrogram", False):
+            audio_data = self._get_audio(idx)
+        else:
+            audio_data = False
 
-        # if self.mode=="test":
-        #     random_idx = random.randint(0, len(self.image)-1)
-        #     sh_images = self._get_images(random_idx)
-        #     sh_spectrogram = self._get_audio(random_idx)
-        #
-        #     return {"data": {0:spectrogram, 1:images, "0_random_indistr": sh_spectrogram, "1_random_indistr": sh_images}, "label": label}
-        #print idx with all output shape
-        # print("idx: {}, spectrogram: {}, images: {}, audio: {}".format(idx, spectrogram.shape, images.shape, audio.shape))
+        # 2. СПЕКТР
+        if self.active_modalities.get("spectrogram", False):
+            data[0] = self._get_spectrogram(idx, audio_data)
+        else:
+            data[0] = False
 
-        return {"data":{0:spectrogram, 1:images, 2:audio, 3:face_features, 4:face_image},"label": label, "idx": idx}
+        # 3. ВИДЕО
+        if self.active_modalities.get("video", False):
+            data[1] = self._get_images(idx)
+        else:
+            data[1] = False
 
+        # 4. АУДИО в data[2]
+        # Если audio=False, тогда audio_data уже False, так что всё корректно
+        data[2] = audio_data
 
-def collate_fn_padd(batch):
-    '''
-    Padds batch of variable length
+        # 5. FACE
+        if self.active_modalities.get("face", False):
+            data[3] = self._get_face(idx)
+        else:
+            data[3] = False
 
-    note: it converts things ToTensor manually here since the ToTensor transform
-    assume it takes in images rather than arbitrary tensors.
-    '''
-    # I have a list of dicts that I would like you to aggregate into a single dict of lists
-    aggregated_batch = {}
-    for key in batch[0].keys():
-        aggregated_batch[key] = {}
-        if type(batch[0][key]) is int:
-            aggregated_batch[key] = torch.LongTensor([d[key] for d in batch])
+        # 6. FACE_IMAGE
+        if self.active_modalities.get("face_image", False):
+            data[4] = self._get_face_image(idx)
+        else:
+            data[4] = False
 
-    key = "data"
-    subkey = 0 #Spectrogram
-    aggregated_list = [d[key][subkey].unsqueeze(dim=0) for d in batch if d[key][subkey] is not False]
-    if len(aggregated_list) > 0:
-        aggregated_batch[key][subkey] = torch.cat(aggregated_list, dim=0)
-
-    subkey = 1 #Video
-    aggregated_list = [d[key][subkey].unsqueeze(dim=0) for d in batch if d[key][subkey] is not False]
-    if len(aggregated_list) > 0:
-        aggregated_batch[key][subkey] = torch.cat(aggregated_list, dim=0)
-
-    subkey = 2 #Audio
-    aggregated_list = [d[key][subkey] for d in batch if d[key][subkey] is not False]
-    if len(aggregated_list) > 0:
-        length_list = [len(d) for d in aggregated_list]
-        aggregated_batch[key][subkey] = torch.nn.utils.rnn.pad_sequence(aggregated_list, batch_first=True)
-        audio_attention_mask = torch.zeros((len(aggregated_list), max(length_list)))
-        for data_idx, dur in enumerate(length_list):
-            audio_attention_mask[data_idx, :dur] = 1
-        aggregated_batch[key]["attention_mask_audio"] = audio_attention_mask
-
-    subkey = 3 #Face
-    aggregated_list = [d[key][subkey] for d in batch if d[key][subkey] is not False]
-    if len(aggregated_list) > 0:
-        length_list = [len(d) for d in aggregated_list]
-        max_length = max(length_list)
-        if max_length>150:
-            # print("Here length was {}".format(length_list))
-            max_length = 150
-            aggregated_list = [i[:max_length] for i in aggregated_list]
-        aggregated_batch[key][subkey] = torch.nn.utils.rnn.pad_sequence(aggregated_list, batch_first=True)
-
-        face_attention_mask = torch.zeros((len(aggregated_list), max_length ))
-        for data_idx, dur in enumerate(length_list):
-            face_attention_mask[data_idx, :dur] = 1
-
-    subkey = 4 #Face_image
-    aggregated_list = [d[key][subkey] for d in batch if d[key][subkey] is not False]
-    if len(aggregated_list) > 0:
-        length_list = [len(d) for d in aggregated_list]
-        max_length = max(length_list)
-        if max_length>150:
-            # print("Here length was {}".format(length_list))
-            max_length = 150
-            aggregated_list = [i[:max_length] for i in aggregated_list]
-        aggregated_batch[key][subkey] = torch.nn.utils.rnn.pad_sequence(aggregated_list, batch_first=True)
-
-        face_attention_mask = torch.zeros((len(aggregated_list), max_length ))
-        for data_idx, dur in enumerate(length_list):
-            face_attention_mask[data_idx, :dur] = 1
+        return {"data": data, "label": self.label[idx], "idx": idx}
 
 
 
-
-    # total_wav = []
-    # total_vid = []
-    # total_lab = []
-    # total_dur = []
-    # total_utt = []
-    #
-    # for cur_batch in batch:
-    #     total_wav.append(torch.Tensor(cur_batch[0]))
-    #     total_vid.append(torch.Tensor(cur_batch[1]))
-    #     total_lab.append(cur_batch[2])
-    #     total_dur.append(cur_batch[3])
-    #
-    #     total_utt.append(cur_batch[4])
-    #     # print(total_utt)
-    #
-    # total_wav = nn.utils.rnn.pad_sequence(total_wav, batch_first=True)
-    # total_vid = nn.utils.rnn.pad_sequence(total_vid, batch_first=True)
-    #
-    # total_lab = torch.Tensor(total_lab)
-    # max_dur = np.max(total_dur)
-    # attention_mask = torch.zeros(total_wav.shape[0], max_dur)
-    # for data_idx, dur in enumerate(total_dur):
-    #     attention_mask[data_idx, :dur] = 1
-    ## compute mask
-
-    return aggregated_batch
-
-class CramedD_Dataloader():
-
+class CramedD_Dataloader:
     def __init__(self, config):
-        """
-        :param config:
-        """
         self.config = config
-
-        sleep_dataset_train, sleep_dataset_val, sleep_dataset_test = self._get_datasets()
+        train_dataset, valid_dataset, test_dataset = self._get_datasets()
 
         def seed_worker(worker_id):
             worker_seed = torch.initial_seed() % 2 ** 32
@@ -659,81 +547,43 @@ class CramedD_Dataloader():
 
         g = torch.Generator()
         g.manual_seed(0)
-
-        # os.system("taskset -c -p 0-95 %d" % os.getpid())
-
-        # num_cores = len(os.sched_getaffinity(0))-1
-        # num_cores = int(len(os.sched_getaffinity(0))/2)
-
+        # При желании можно включить больше потоков
         num_cores = 0
+        print(f"Available cores {len(os.sched_getaffinity(0))}")
+        print(f"Using {num_cores} workers")
 
-        print("Available cores {}".format(len(os.sched_getaffinity(0))))
-        print("We are changing dataloader workers to num of cores {}".format(num_cores))
+        self.train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=self.config.training_params.batch_size,
+            num_workers=num_cores,
+            shuffle=True,
+            pin_memory=self.config.training_params.pin_memory,
+            generator=g,
+            collate_fn=collate_fn_padd,
+            worker_init_fn=seed_worker
+        )
 
-        self.train_loader = torch.utils.data.DataLoader(sleep_dataset_train,
-                                                        batch_size=self.config.training_params.batch_size,
-                                                        num_workers=num_cores,
-                                                        shuffle=True,
-                                                        pin_memory=self.config.training_params.pin_memory,
-                                                        generator=g,
-                                                        collate_fn=collate_fn_padd,
-                                                        worker_init_fn=seed_worker)
-        self.valid_loader = torch.utils.data.DataLoader(sleep_dataset_val,
-                                                        batch_size=self.config.training_params.test_batch_size,
-                                                        shuffle=False,
-                                                        num_workers=num_cores,
-                                                        collate_fn=collate_fn_padd,
-                                                        pin_memory=self.config.training_params.pin_memory)
-        self.test_loader = torch.utils.data.DataLoader(sleep_dataset_test,
-                                                       batch_size=self.config.training_params.test_batch_size,
-                                                       shuffle=False,
-                                                       num_workers=num_cores,
-                                                       collate_fn=collate_fn_padd,
-                                                       pin_memory=self.config.training_params.pin_memory)
+        self.valid_loader = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=self.config.training_params.test_batch_size,
+            shuffle=False,
+            num_workers=num_cores,
+            collate_fn=collate_fn_padd,
+            pin_memory=self.config.training_params.pin_memory
+        )
 
-        # self.total_loader = torch.utils.data.DataLoader(sleep_dataset_total,
-        #                                                 batch_size=self.config.training_params.test_batch_size,
-        #                                                shuffle=False,
-        #                                                 num_workers=self.config.training_params.data_loader_workers,
-        #                                                pin_memory=self.config.training_params.pin_memory)
+        self.test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=self.config.training_params.test_batch_size,
+            shuffle=False,
+            num_workers=num_cores,
+            collate_fn=collate_fn_padd,
+            pin_memory=self.config.training_params.pin_memory
+        )
 
     def _get_datasets(self):
-
-        train_dataset = CremadDataset(config=self.config, mode="train")
-        valid_dataset = CremadDataset(config=self.config, mode="val")
-        test_dataset = CremadDataset(config=self.config, mode="test")
-        # total_dataset = CremadDataset(config=self.config, mode="total")
-
-        return train_dataset, valid_dataset, test_dataset
-
-# a = CremadDataset(config = {}, visual_path = "/esat/smcdata/users/kkontras/Image_Dataset/no_backup/CremaD/CREMA-D",
-#                   audio_path="/esat/smcdata/users/kkontras/Image_Dataset/no_backup/CremaD/CREMA-D/AudioWAV", fps=1, mode="train")
-# b = a.__getitem__(0)
-# import matplotlib.pyplot as plt
-# import einops
-# plt.imshow(einops.rearrange(b["data"][1][0],"a b c -> b c a").squee
-
-
-
-# save_dir = "/esat/smcdata/users/kkontras/Image_Dataset/no_backup/data/2023_data/CREMAD_models/unimodal_audio_VAVL_linearcls_fold0.pth.tar"
-# checkpoint = torch.load(save_dir, map_location="cpu")
-# new_checkpoint = {}
-# new_checkpoint["logs"] = checkpoint["logs"]
-# new_checkpoint["optimizer_state_dict"] = checkpoint["optimizer_state_dict"]
-# new_checkpoint["scheduler_state_dict"] = checkpoint["scheduler_state_dict"]
-# new_checkpoint["configs"] = checkpoint["configs"]
-#
-# new_best_model_state_dict = {".".join(i.split(".")[1:]):checkpoint["model_state_dict"][i]  for i in checkpoint["best_model_state_dict"]}
-# new_model_state_dict = {".".join(i.split(".")[1:]):checkpoint["model_state_dict"][i]  for i in checkpoint["model_state_dict"]}
-# new_checkpoint["best_model_state_dict"] = new_best_model_state_dict
-# new_checkpoint["model_state_dict"] = new_model_state_dict
-# new_save_dir = '/esat/smcdata/users/kkontras/Image_Dataset/no_backup/data/2023_data/CREMAD_models/unimodal_audio_VAVL_linearcls_nm_fold0.pth.tar'
-# torch.save(new_checkpoint, new_save_dir)
-
-#check if two lists contain any same elements
-# a = [1,2,3]
-# b = [4,5,6]
-# check it
-# print(set(a).isdisjoint(b))
-
-#remove duplicated
+        return (
+            CremadDataset(config=self.config, mode="train"),
+            CremadDataset(config=self.config, mode="val"),
+            CremadDataset(config=self.config, mode="test")
+        )
