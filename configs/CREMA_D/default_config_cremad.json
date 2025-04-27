@@ -46,7 +46,7 @@
   },
   "dataset": {
       "dataloader_class": "CramedD_Dataloader",
-      "data_roots": "/content/drive/MyDrive/CREMA/Datasets",
+      "data_roots": "/kaggle/input/crema-d-emotional-multimodal-dataset/content/CREMA-D",
       "norm_wav_path": "./datasets/CREMAD/wav_norm_16000_fold{}.pkl",
       "norm_face_path": "./datasets/CREMAD/norm_face_path_fold{}.pkl",
       "return_data":{"video": true, "spectrogram":true, "audio":false, "face":false},
@@ -58,7 +58,7 @@
       "num_frame": 3
   },
   "model": {
-    "save_base_dir": "/content/drive/MyDrive/CREMA/Datasets/CREMAD_models"
+    "save_base_dir": "/kaggle/working/saved_models"
   }
 }
 {
@@ -109,7 +109,7 @@
   },
   "dataset": {
       "dataloader_class": "CramedD_Dataloader",
-      "data_roots": "/content/drive/MyDrive/CREMA/Datasets",
+      "data_roots": "/kaggle/input/crema-d-emotional-multimodal-dataset/content/CREMA-D",
       "norm_wav_path": "./datasets/CREMAD/wav_norm_16000_fold{}.pkl",
       "norm_face_path": "./datasets/CREMAD/norm_face_path_fold{}.pkl",
       "return_data":{"video": true, "spectrogram":true, "audio":false, "face":false},
@@ -121,6 +121,6 @@
       "num_frame": 3
   },
   "model": {
-    "save_base_dir": "/content/drive/MyDrive/CREMA/Datasets/CREMAD_models"
+    "save_base_dir": "/kaggle/working/saved_models"
   }
 }
