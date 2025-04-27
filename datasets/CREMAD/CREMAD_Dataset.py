@@ -80,8 +80,8 @@ def collate_fn_padd(batch):
 
 class CremadDataset(Dataset):
 
-    def __init__(self, config, visual_path="/content/drive/MyDrive/CREMA/Datasets",
-                 audio_path="/content/drive/MyDrive/CREMA/Datasets/AudioWAV", fps=1, mode='train'):
+    def __init__(self, config, visual_path="/kaggle/input/image-01-fps",
+                 audio_path="/kaggle/input/crema-d-emotional-multimodal-dataset/content/CREMA-D/AudioWAV", fps=1, mode='train'):
         # Смотрим, какие модальности включены в конфиге
         self.active_modalities = config.dataset.get(
             "return_data",
